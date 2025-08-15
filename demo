@@ -1,0 +1,226 @@
+# file_processor.py
+import os
+import hashlib
+from typing import List, Dict, Optional, Any
+from pathlib import Path
+from dataclasses import dataclass
+import logging
+
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader, 
+    UnstructuredExcelLoader,
+    UnstructuredMarkdownLoader,
+    TextLoader,
+    CSVLoader,
+    UnstructuredPowerPointLoader
+)
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_qdrant import Qdrant
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProcessConfig:
+    """处理配置"""
+    chunk_size: int = 500
+    chunk_overlap: int = 100
+    separators: List[str] = None
+    ollama_model: str = "nomic-embed-text"
+    ollama_base_url: str = "http://localhost:11434"
+    collection_name: str = "rag_documents"
+    qdrant_url: str = "localhost"
+    qdrant_port: int = 6333
+    batch_size: int = 32
+
+    def __post_init__(self):
+        if self.separators is None:
+            self.separators = ["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
+
+
+class DocumentProcessor:
+    """文档处理器 - 负责加载、分割、向量化和存储"""
+    
+    def __init__(self, config: ProcessConfig = None):
+        self.config = config or ProcessConfig()
+        self._init_components()
+        
+    def _init_components(self):
+        """初始化组件"""
+        # 初始化文本分割器
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            separators=self.config.separators,
+            length_function=len,
+        )
+        
+        # 初始化Ollama嵌入模型
+        self.embeddings = OllamaEmbeddings(
+            model=self.config.ollama_model,
+            base_url=self.config.ollama_base_url
+        )
+        
+        # 初始化Qdrant客户端
+        self.qdrant_client = QdrantClient(
+            host=self.config.qdrant_url,
+            port=self.config.qdrant_port
+        )
+        
+        # 确保集合存在
+        self._ensure_collection()
+        
+    def _ensure_collection(self):
+        """确保向量集合存在"""
+        try:
+            # 获取embedding维度
+            test_embedding = self.embeddings.embed_query("test")
+            embedding_dim = len(test_embedding)
+            
+            collections = self.qdrant_client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            
+            if self.config.collection_name not in collection_names:
+                self.qdrant_client.create_collection(
+                    collection_name=self.config.collection_name,
+                    vectors_config=qmodels.VectorParams(
+                        size=embedding_dim,
+                        distance=qmodels.Distance.COSINE
+                    )
+                )
+                logger.info(f"Created collection: {self.config.collection_name}")
+        except Exception as e:
+            logger.error(f"Error ensuring collection: {e}")
+            raise
+    
+    def get_loader(self, file_path: str):
+        """根据文件类型选择加载器"""
+        ext = Path(file_path).suffix.lower()
+        
+        loader_map = {
+            '.pdf': PyPDFLoader,
+            '.docx': Docx2txtLoader,
+            '.doc': Docx2txtLoader,
+            '.xlsx': UnstructuredExcelLoader,
+            '.xls': UnstructuredExcelLoader,
+            '.md': UnstructuredMarkdownLoader,
+            '.markdown': UnstructuredMarkdownLoader,
+            '.txt': TextLoader,
+            '.csv': CSVLoader,
+            '.ppt': UnstructuredPowerPointLoader,
+            '.pptx': UnstructuredPowerPointLoader,
+        }
+        
+        loader_class = loader_map.get(ext, TextLoader)
+        
+        # 某些loader需要特殊参数
+        if ext == '.csv':
+            return loader_class(file_path, encoding='utf-8')
+        elif ext in ['.xlsx', '.xls']:
+            return loader_class(file_path, mode="elements")
+        else:
+            return loader_class(file_path)
+    
+    def compute_file_hash(self, file_path: str) -> str:
+        """计算文件内容哈希"""
+        hasher = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    
+    def load_document(self, file_path: str) -> List[Document]:
+        """加载文档"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        loader = self.get_loader(file_path)
+        documents = loader.load()
+        
+        # 添加额外的元数据
+        file_hash = self.compute_file_hash(file_path)
+        for doc in documents:
+            doc.metadata.update({
+                'source': file_path,
+                'file_name': os.path.basename(file_path),
+                'file_type': Path(file_path).suffix.lower(),
+                'file_hash': file_hash,
+                'file_size': os.path.getsize(file_path),
+            })
+        
+        logger.info(f"Loaded {len(documents)} pages from {file_path}")
+        return documents
+    
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        """分割文档"""
+        chunks = self.text_splitter.split_documents(documents)
+        
+        # 为每个chunk添加索引
+        for i, chunk in enumerate(chunks):
+            chunk.metadata['chunk_index'] = i
+            chunk.metadata['chunk_hash'] = hashlib.sha256(
+                chunk.page_content.encode()
+            ).hexdigest()[:16]
+        
+        logger.info(f"Split into {len(chunks)} chunks")
+        return chunks
+    
+    def process_file(self, file_path: str) -> Dict[str, Any]:
+        """处理单个文件的完整流程"""
+        try:
+            # 1. 加载文档
+            documents = self.load_document(file_path)
+            
+            # 2. 分割文档
+            chunks = self.split_documents(documents)
+            
+            # 3. 创建向量存储并添加文档
+            vector_store = Qdrant(
+                client=self.qdrant_client,
+                collection_name=self.config.collection_name,
+                embeddings=self.embeddings,
+            )
+            
+            # 批量添加文档
+            chunk_ids = []
+            for i in range(0, len(chunks), self.config.batch_size):
+                batch = chunks[i:i + self.config.batch_size]
+                ids = vector_store.add_documents(batch)
+                chunk_ids.extend(ids)
+                logger.info(f"Processed {min(i + self.config.batch_size, len(chunks))}/{len(chunks)} chunks")
+            
+            return {
+                'status': 'success',
+                'file_path': file_path,
+                'total_chunks': len(chunks),
+                'chunk_ids': chunk_ids
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing file {file_path}: {e}")
+            return {
+                'status': 'error',
+                'file_path': file_path,
+                'error': str(e)
+            }
+    
+    def process_directory(self, dir_path: str, extensions: List[str] = None) -> List[Dict]:
+        """批量处理目录下的文件"""
+        if extensions is None:
+            extensions = ['.pdf', '.docx', '.txt', '.md', '.xlsx']
+        
+        results = []
+        for root, _, files in os.walk(dir_path):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in extensions):
+                    file_path = os.path.join(root, file)
+                    result = self.process_file(file_path)
+                    results.append(result)
+        
+        return results
